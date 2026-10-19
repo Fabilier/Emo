@@ -1,268 +1,358 @@
-import time
-from board import SCL, SDA
-import busio
-from adafruit_servokit import ServoKit
-import multiprocessing
-import RPi.GPIO as GPIO
-import os
-import sys 
+#!/usr/bin/env python3
+"""Emo, robot compagnon : écran, servos, capteurs et sons.
+
+Prérequis : Raspberry Pi, adafruit-circuitpython-servokit, RPi.GPIO, spidev, Pillow, alsa-utils (aplay).
+Sons : python3 generate_sounds.py (une fois), dossier ./sound.
+Exécution : python3 final.py   (Ctrl+C pour quitter proprement)
+"""
 import logging
-import spidev as SPI
-from PIL import Image, ImageDraw, ImageFont
-from random import randint
+import os
+import queue
+import subprocess
+import threading
+import time
+from random import choice, randint
 
-# Pins pour les capteurs tactiles et de vibration
-touch_pin = 17
-vibration_pin = 22
+import RPi.GPIO as GPIO
+from adafruit_servokit import ServoKit
+from PIL import Image
 
-# Configuration des GPIO pour les capteurs
+from lib import LCD_2inch
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+try:
+    import brain  # nécessite `requests` ; sans lui Emo fonctionne sans conversation
+except ImportError as e:
+    brain = None
+    logging.warning('conversation désactivée : %s', e)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EMOTIONS_DIR = os.path.join(BASE_DIR, 'emotions')
+SOUND_DIR = os.path.join(BASE_DIR, 'sound')
+
+
+# Capteurs
+TOUCH_PIN = 17
+VIBRATION_PIN = 22
+TOUCH_COOLDOWN = 1.5       # s min entre deux réactions
+VIBRATION_COOLDOWN = 3.0
+IDLE_BLINK_EVERY = 3       # une animation de clignement toutes les N boucles neutres
+
+# Réactions au choc
+SHOCK_EMOTIONS = ['angry', 'sad', 'excited', 'dizzy']
+
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(touch_pin, GPIO.IN)
-GPIO.setup(vibration_pin, GPIO.IN)
+GPIO.setup(TOUCH_PIN, GPIO.IN)
+GPIO.setup(VIBRATION_PIN, GPIO.IN)
 
-# Configuration des pins pour l'écran LCD sur le Raspberry Pi
-RST = 27
-DC = 25
-BL = 18
-bus = 0 
-device = 0 
-
-# Initialisation du kit de servos
 kit = ServoKit(channels=16)
+servoR = kit.servo[5]   # bras droit, 0 = bas
+servoL = kit.servo[11]  # bras gauche, 180 = bas
+servoB = kit.servo[13]  # base, 90 = centre
 
-# Déclaration des servos sur des canaux spécifiques
-servoR = kit.servo[5]  # Servo droit, référence à 0 degrés
-servoL = kit.servo[11] # Servo gauche, référence à 180 degrés
-servoB = kit.servo[13] # Servo central, référence à 90 degrés
+events = queue.Queue()
+stop = threading.Event()        # interrompt l'animation en cours
+shutdown = threading.Event()    # arrêt du programme
+disp_lock = threading.Lock()    # un seul accès SPI à la fois
 
-# Dictionnaire pour stocker le nombre d'images pour chaque émotion
-frame_count = {
-    'blink': 39, 'happy': 60, 'sad': 47, 'dizzy': 67, 'excited': 24, 
-    'neutral': 61, 'happy2': 20, 'angry': 20, 'happy3': 26, 'bootup3': 124, 
-    'blink2': 20
-}
+disp = LCD_2inch.LCD_2inch()
+disp.Init()
 
-# Liste d'émotions aléatoires à déclencher
-emotion = ['angry', 'sad', 'excited']
 
-# Liste d'états normaux/neutres
-normal = ['neutral', 'blink2']
+def count_frames(name):
+    """Nombre réel d'images d'une émotion (évite les décalages avec le disque)."""
+    d = os.path.join(EMOTIONS_DIR, name)
+    return len([f for f in os.listdir(d) if f.startswith('frame') and f.endswith('.png')])
 
-# Création d'une file d'attente pour les émotions et d'un événement pour la synchronisation des processus
-q = multiprocessing.Queue()
-event = multiprocessing.Event()
 
-# Fonction pour vérifier les capteurs tactiles et de vibration
-def check_sensor():
-    previous_state = 1  # État précédent du capteur tactile
-    current_state = 0   # État actuel
-    while True:
-        # Vérifier l'état du capteur tactile
-        if GPIO.input(touch_pin) == GPIO.HIGH:
-            if previous_state != current_state:
-                if q.qsize() == 0:
-                    event.set()  # Déclencher l'événement si la file d'attente est vide
-                    q.put('happy')  # Ajouter l'émotion "happy" dans la file
-                current_state = 1
-            else:
-                current_state = 0
-        # Vérifier l'état du capteur de vibration
-        if GPIO.input(vibration_pin) == 1:
-            print('vib')
-            if q.qsize() == 0:
-                event.set()
-                # Ajouter une émotion aléatoire dans la file
-                q.put(emotion[randint(0, 2)])
-        time.sleep(0.05)  # Délai pour limiter la vérification rapide
+def load_frames(name):
+    """Charge toutes les images en mémoire une fois (écran plus fluide)."""
+    frames = []
+    for i in range(count_frames(name)):
+        try:
+            frames.append(Image.open(os.path.join(EMOTIONS_DIR, name, f'frame{i}.png')).convert('RGB'))
+        except OSError as e:
+            logging.warning('image %s/%d illisible : %s', name, i, e)
+    return frames
 
-# Fonction pour positionner les servos dans une position neutre (90 degrés)
-def servoMed():
-    servoR.angle = 90
-    servoL.angle = 90
-    servoB.angle = 90
 
-# Fonction pour abaisser les servos
-def servoDown():
-    servoR.angle = 0
-    servoL.angle = 180
-    servoB.angle = 90
+FRAMES = {n: load_frames(n) for n in os.listdir(EMOTIONS_DIR)
+          if os.path.isdir(os.path.join(EMOTIONS_DIR, n)) and n not in ('sleep', 'bootup')}
 
-# Fonction pour faire tourner le servo central avec des mouvements de va-et-vient
-def baserotate(reference, change, timedelay):
-    for i in range(reference, reference + change, 1):
-        servoB.angle = i
-        time.sleep(timedelay)
-    for j in range(reference + change, reference - change, -1):
-        servoB.angle = j
-        time.sleep(timedelay)
-    for k in range(reference - change, reference, 1):
-        servoB.angle = k
-        time.sleep(timedelay)
 
-# Fonction pour lever les bras du robot de bas en haut
-def HandDownToUp(start, end, timedelay):
-    for i, j in zip(range(0 + start, end, 1), range((180 - start), (180 - end), -1)):
+def interruptible_sleep(duration):
+    """Dort en s'arrêtant dès que `stop` est levé. Retourne True si interrompu."""
+    return stop.wait(duration)
+
+
+# ---------- Affichage et son ----------
+
+def show(name, repeat=1):
+    for _ in range(repeat):
+        for frame in FRAMES[name]:
+            if stop.is_set():
+                return
+            with disp_lock:
+                disp.ShowImage(frame)
+
+
+def sound(name):
+    path = os.path.join(SOUND_DIR, name + '.wav')
+    if not os.path.exists(path):
+        return
+    try:
+        proc = subprocess.Popen(['aplay', '-q', path])
+    except OSError as e:
+        logging.warning('aplay indisponible : %s', e)
+        return
+    while proc.poll() is None:
+        if stop.wait(0.05):
+            proc.terminate()
+            break
+    proc.wait()
+
+
+# ---------- Servos ----------
+
+def servo_med():
+    servoR.angle = servoL.angle = servoB.angle = 90
+
+
+def servo_down():
+    servoR.angle, servoL.angle, servoB.angle = 0, 180, 90
+
+
+def sweep(servo, start, end, delay, step=1):
+    """Déplace un servo en s'arrêtant si `stop` est levé."""
+    for a in range(start, end, step if end > start else -step):
+        if stop.is_set():
+            return
+        servo.angle = a
+        time.sleep(delay)
+
+
+def baserotate(reference, change, delay):
+    sweep(servoB, reference, reference + change, delay)
+    sweep(servoB, reference + change, reference - change, delay)
+    sweep(servoB, reference - change, reference, delay)
+
+
+def hands(start, end, delay):
+    """Bras de `start` à `end` (degrés côté droit), le gauche en miroir."""
+    step = 1 if end > start else -1
+    for i in range(start, end, step):
+        if stop.is_set():
+            return
         servoR.angle = i
-        servoL.angle = j
-        time.sleep(timedelay)
+        servoL.angle = 180 - i
+        time.sleep(delay)
 
-# Fonction pour abaisser les bras du robot de haut en bas
-def HandUpToDown(start, end, timedelay):
-    for i, j in zip(range(0 + start, end, -1), range((180 - start), (180 - end), 1)):
-        servoR.angle = i
-        servoL.angle = j
-        time.sleep(timedelay)
 
-# Fonction pour contrôler la rotation des bras du robot
-def rotate(start, end, timedelay):
-    if start < end:
-        HandDownToUp(start, end, timedelay)
-        HandUpToDown(end, start, timedelay)
-    else:
-        HandUpToDown(end, start, timedelay)
-        HandDownToUp(start, end, timedelay)
+def rotate(start, end, delay):
+    hands(start, end, delay)
+    hands(end, start, delay)
 
-# Fonction pour simuler une animation de bonheur avec les servos
+
 def happy():
-    servoMed()
-    for n in range(5):
-        for i in range(0, 120):
+    servo_med()
+    for _ in range(5):
+        for i in range(120):
+            if stop.is_set():
+                return
             if i <= 30:
-                servoR.angle = 90 + i
-                servoL.angle = 90 - i
-                servoB.angle = 90 - i
-            if 30 < i <= 90:
-                servoR.angle = 150 - i
-                servoL.angle = i + 30
-                servoB.angle = i + 30
-            if i > 90:
-                servoR.angle = i - 30
-                servoL.angle = 210 - i
-                servoB.angle = 210 - i
+                servoR.angle, servoL.angle, servoB.angle = 90 + i, 90 - i, 90 - i
+            elif i <= 90:
+                servoR.angle, servoL.angle, servoB.angle = 150 - i, i + 30, i + 30
+            else:
+                servoR.angle, servoL.angle, servoB.angle = i - 30, 210 - i, 210 - i
             time.sleep(0.004)
 
-# Fonction pour simuler une animation de colère
+
 def angry():
-    for i in range(5):
-        baserotate(90, randint(0, 30), 0.01)
+    servo_down()
+    for _ in range(5):
+        baserotate(90, randint(10, 30), 0.01)
 
-# Autre animation de colère
-def angry2():
-    servoMed()
-    for i in range(90):
-        servoR.angle = 90 - i
-        servoL.angle = i + 90
-        servoB.angle = 90 - randint(-12, 12)
-        time.sleep(0.02)
 
-# Animation de tristesse
 def sad():
-    servoDown()
-    for i in range(0, 60):
-        if i <= 15:
-            servoB.angle = 90 - i
-        if 15 < i <= 45:
-            servoB.angle = 60 + i
-        if i > 45:
-            servoB.angle = 150 - i
+    servo_down()
+    for i in range(60):
+        if stop.is_set():
+            return
+        servoB.angle = 90 - i if i <= 15 else (60 + i if i <= 45 else 150 - i)
         time.sleep(0.09)
 
-# Animation d'excitation
+
 def excited():
-    servoDown()
-    for i in range(0, 120):
-        if i <= 30:
-            servoB.angle = 90 - i
-        if 30 < i <= 90:
-            servoB.angle = i + 30
-        if i > 90:
-            servoB.angle = 210 - i
+    servo_down()
+    for i in range(120):
+        if stop.is_set():
+            return
+        servoB.angle = 90 - i if i <= 30 else (i + 30 if i <= 90 else 210 - i)
         time.sleep(0.01)
 
-# Animation de clignotement
+
+def dizzy():
+    servo_med()
+    for i in range(80):
+        if stop.is_set():
+            return
+        servoB.angle = 90 + (25 if i % 2 else -25) * (1 - i / 80)
+        time.sleep(0.05)
+
+
 def blink():
-    servoR.angle = 0
-    servoL.angle = 180
-    servoB.angle = 90
+    servo_down()
 
-# Séquence d'initialisation au démarrage
-def bootup():
-    show('bootup3', 1)
-    for i in range(1):
-        p2 = multiprocessing.Process(target=show, args=('blink2', 3))
-        p3 = multiprocessing.Process(target=rotate, args=(0, 150, 0.005))
-        p4 = multiprocessing.Process(target=baserotate, args=(90, 45, 0.01))
-        p2.start()
-        p3.start()
-        p4.start()
-        p4.join()
-        p2.join()
-        p3.join()
 
-# Fonction pour jouer un son correspondant à une émotion
-def sound(emotion):
-    for i in range(1):
-        os.system("aplay /home/pi/Desktop/EmoBot/sound/" + emotion + ".wav")
+EMOTION_MOVES = {'happy': happy, 'angry': angry, 'sad': sad,
+                 'excited': excited, 'dizzy': dizzy, 'blink': blink}
 
-# Fonction pour afficher une séquence d'images correspondant à une émotion
-def show(emotion, count):
-    for i in range(count):
+
+# ---------- Capteurs ----------
+
+def check_sensors():
+    """Surveille toucher et vibration ; un seul événement en attente à la fois."""
+    last_touch = last_vib = 0.0
+    touch_prev = False
+    while not shutdown.is_set():
+        now = time.monotonic()
+        touched = GPIO.input(TOUCH_PIN) == GPIO.HIGH
+        if touched and not touch_prev and now - last_touch > TOUCH_COOLDOWN and events.empty():
+            last_touch = now
+            events.put('talk' if brain and brain.enabled() else 'happy')
+        touch_prev = touched
+        if GPIO.input(VIBRATION_PIN) == GPIO.HIGH and now - last_vib > VIBRATION_COOLDOWN and events.empty():
+            last_vib = now
+            events.put(choice(SHOCK_EMOTIONS))
+        shutdown.wait(0.05)
+
+
+# ---------- Orchestration ----------
+
+def run_parallel(*targets):
+    """Lance les cibles en parallèle ; relève la première exception d'un worker après le join."""
+    errors = []
+
+    def runner(fn, args):
         try:
-            disp = LCD_2inch.LCD_2inch()
-            disp.Init()
-            for i in range(frame_count[emotion]):
-                image = Image.open('/home/pi/Desktop/EmoBot/emotions/' + emotion + '/frame' + str(i) + '.png')
-                disp.ShowImage(image)
-        except IOError as e:
-            logging.info(e)
-        except KeyboardInterrupt:
-            disp.module_exit()
-            servoDown()
-            logging.info("quit:")
-            exit()
+            fn(*args)
+        except Exception as e:
+            errors.append(e)
 
-# Fonction principale exécutée au lancement
-if __name__ == '__main__':
-    p1 = multiprocessing.Process(target=check_sensor, name='p1')
-    p1.start()
-    bootup()
-    
+    threads = [threading.Thread(target=runner, args=(t, a), daemon=True) for t, a in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
+def safe(fn, *args):
+    """Une erreur d'affichage ou de servo est journalisée, Emo continue."""
+    try:
+        fn(*args)
+    except Exception as e:
+        logging.warning('%s a échoué : %s', fn.__name__, e)
+
+
+def bootup():
+    run_parallel((show, ('bootup3',)), (sound, ('bootup',)))
+    run_parallel((show, ('blink2', 3)), (rotate, (0, 150, 0.005)),
+                 (baserotate, (90, 45, 0.01)))
+
+
+def play_emotion(name):
+    logging.info('émotion : %s', name)
+    run_parallel((show, (name, 4)), (sound, (name,)), (EMOTION_MOVES[name], ()))
+
+
+def think(ev):
+    """Animation de réflexion tant que `ev` n'est pas levé."""
+    while not ev.is_set() and not stop.is_set():
+        for frame in FRAMES['blink2']:
+            if ev.is_set() or stop.is_set():
+                return
+            with disp_lock:
+                disp.ShowImage(frame)
+
+
+def talk(history=[]):
+    """Conversation : écoute, LLM, puis réponse parlée avec l'émotion choisie."""
+    try:
+        threading.Thread(target=sound, args=('blink',), daemon=True).start()  # bip : je t'écoute
+        run_parallel((show, ('neutral', 1)))
+        heard = brain.listen()
+        if not heard:
+            return
+        logging.info('entendu : %s', heard)
+        done = threading.Event()
+        thinker = threading.Thread(target=think, args=(done,), daemon=True)
+        thinker.start()
+        try:
+            reply, emo = brain.ask(heard, history)
+        finally:
+            done.set()
+            thinker.join()
+        history += [{'role': 'user', 'content': heard}, {'role': 'assistant', 'content': reply}]
+        del history[:-6]
+        run_parallel((show, (emo, 2)), (brain.speak, (reply, stop)), (EMOTION_MOVES[emo], ()))
+    except Exception as e:  # réseau, micro, voix : Emo ne doit jamais planter
+        logging.warning('conversation impossible : %s', e)
+        play_emotion('sad')
+
+
+def idle(cycle):
+    """Une boucle d'attente ; s'interrompt dès qu'un événement arrive."""
+    face = 'blink2' if cycle % IDLE_BLINK_EVERY == 0 else 'neutral'
+    run_parallel((show, (face, 2)), (baserotate, (90, 60, 0.02)))
+
+
+def main():
+    threading.Thread(target=check_sensors, daemon=True).start()
+    if brain:
+        brain.preload()
+    safe(bootup)
+    cycle = 0
     while True:
-        if event.is_set():
-            p5.terminate()
-            event.clear()
-            emotion = q.get()
-            q.empty()
-            print(emotion)
-            p2 = multiprocessing.Process(target=show, args=(emotion, 4))
-            p3 = multiprocessing.Process(target=sound, args=(emotion,))
-            if emotion == 'happy':
-                p4 = multiprocessing.Process(target=happy)
-            elif emotion == 'angry':
-                p4 = multiprocessing.Process(target=angry)
-            elif emotion == 'sad':
-                p4 = multiprocessing.Process(target=sad)
-            elif emotion == 'excited':
-                p4 = multiprocessing.Process(target=excited)
-            elif emotion == 'blink':
-                p4 = multiprocessing.Process(target=blink)
-            else:
-                continue
-            p2.start()
-            p3.start()
-            p4.start()
-            p2.join()
-            p3.join()
-            p4.join()
-        else:
-            p = multiprocessing.active_children()
-            for i in p:
-                if i.name not in ['p1', 'p5', 'p6']:
-                    i.terminate()
-            neutral = normal[0]
-            p5 = multiprocessing.Process(target=show, args=(neutral, 4), name='p5')
-            p6 = multiprocessing.Process(target=baserotate, args=(90, 60, 0.02), name='p6')
-            p5.start()
-            p6.start()
-            p6.join()
-            p5.join()
+        try:
+            name = events.get_nowait()
+        except queue.Empty:
+            name = None
+        if name == 'talk':
+            stop.clear()
+            talk()
+            servo_down()
+            continue
+        if name in EMOTION_MOVES:
+            stop.clear()
+            safe(play_emotion, name)
+            servo_down()
+            continue
+        # on interrompt l'attente dès qu'un événement arrive
+        stop.clear()
+        cycle += 1
+        idle_thread = threading.Thread(target=safe, args=(idle, cycle), daemon=True)
+        idle_thread.start()
+        while idle_thread.is_alive():
+            if not events.empty():
+                stop.set()
+            idle_thread.join(0.05)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info('arrêt demandé')
+    finally:
+        shutdown.set()
+        stop.set()
+        try:
+            servo_down()
+            disp.module_exit()
+        except Exception as e:
+            logging.warning('nettoyage : %s', e)
+        GPIO.cleanup()
