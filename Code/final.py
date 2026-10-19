@@ -244,15 +244,33 @@ def play_emotion(name):
     run_parallel((show, (name, 4)), (sound, (name,)), (EMOTION_MOVES[name], ()))
 
 
+def think(ev):
+    """Animation de réflexion tant que `ev` n'est pas levé."""
+    while not ev.is_set() and not stop.is_set():
+        for frame in FRAMES['blink2']:
+            if ev.is_set() or stop.is_set():
+                return
+            with disp_lock:
+                disp.ShowImage(frame)
+
+
 def talk(history=[]):
     """Conversation : écoute, LLM, puis réponse parlée avec l'émotion choisie."""
     try:
+        threading.Thread(target=sound, args=('blink',), daemon=True).start()  # bip : je t'écoute
         run_parallel((show, ('neutral', 1)))
         heard = brain.listen()
         if not heard:
             return
         logging.info('entendu : %s', heard)
-        reply, emo = brain.ask(heard, history)
+        done = threading.Event()
+        thinker = threading.Thread(target=think, args=(done,), daemon=True)
+        thinker.start()
+        try:
+            reply, emo = brain.ask(heard, history)
+        finally:
+            done.set()
+            thinker.join()
         history += [{'role': 'user', 'content': heard}, {'role': 'assistant', 'content': reply}]
         del history[:-6]
         run_parallel((show, (emo, 2)), (brain.speak, (reply, stop)), (EMOTION_MOVES[emo], ()))
@@ -269,6 +287,7 @@ def idle(cycle):
 
 def main():
     threading.Thread(target=check_sensors, daemon=True).start()
+    brain.preload()
     bootup()
     cycle = 0
     while True:

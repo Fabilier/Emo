@@ -13,6 +13,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import wave
+from array import array
 
 import requests
 
@@ -50,6 +53,7 @@ def load_env(path=os.path.join(BASE_DIR, '.env')):
 
 
 load_env()
+session = requests.Session()  # connexion gardée ouverte : pas de poignée de main TLS à chaque question
 
 
 def enabled():
@@ -84,20 +88,61 @@ def ask(user_text, history=None):
     url = os.environ.get('LLM_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai').rstrip('/')
     messages = [{'role': 'system', 'content': system_prompt()}, *(history or []),
                 {'role': 'user', 'content': user_text}]
-    r = requests.post(
+    body = {'model': os.environ.get('LLM_MODEL', 'gemini-2.5-flash-lite'), 'messages': messages,
+            'response_format': {'type': 'json_object'}, 'max_tokens': 80}
+    if os.environ.get('LLM_REASONING_EFFORT'):  # ex. none sur Gemini : pas de phase de réflexion
+        body['reasoning_effort'] = os.environ['LLM_REASONING_EFFORT']
+    r = session.post(
         url + '/chat/completions', timeout=20,
         headers={'Authorization': 'Bearer ' + os.environ['LLM_API_KEY']},
-        json={'model': os.environ.get('LLM_MODEL', 'gemini-2.5-flash'), 'messages': messages,
-              'response_format': {'type': 'json_object'}, 'max_tokens': 80})
+        json=body)
     r.raise_for_status()
     return parse_reply(r.json()['choices'][0]['message']['content'])
 
 
-def listen(seconds=5):
-    """Enregistre le micro puis transcrit (STT_PROVIDER=local par défaut, ou api)."""
+def record(path, max_s=8.0, silence_s=0.8, wait_s=4.0):
+    """Enregistre jusqu'à `silence_s` de silence après la parole (au lieu de 5 s fixes).
+    Retourne False si personne n'a parlé dans les `wait_s` premières secondes."""
+    thr = int(os.environ.get('SILENCE_RMS', '500'))
+    rate, chunk = 16000, 1600  # morceaux de 0,1 s
+    proc = subprocess.Popen(['arecord', '-q', '-f', 'S16_LE', '-r', str(rate), '-c', '1', '-t', 'raw'],
+                            stdout=subprocess.PIPE)
+    frames, spoke, quiet, elapsed = [], False, 0.0, 0.0
+    try:
+        while elapsed < max_s:
+            data = proc.stdout.read(chunk * 2)
+            if len(data) < chunk * 2:
+                break
+            samples = array('h', data)
+            rms = (sum(x * x for x in samples) / len(samples)) ** 0.5
+            elapsed += 0.1
+            frames.append(data)
+            if rms > thr:
+                spoke, quiet = True, 0.0
+            elif spoke:
+                quiet += 0.1
+                if quiet >= silence_s:
+                    break
+            elif elapsed >= wait_s:
+                return False
+    finally:
+        proc.terminate()
+        proc.wait()
+    if not spoke:
+        return False
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b''.join(frames))
+    return True
+
+
+def listen():
+    """Enregistre (arrêt au silence) puis transcrit (STT_PROVIDER=local par défaut, ou api)."""
     with tempfile.NamedTemporaryFile(suffix='.wav') as tmp:
-        subprocess.run(['arecord', '-q', '-f', 'S16_LE', '-r', '16000', '-d', str(seconds), tmp.name],
-                       check=True)
+        if not record(tmp.name):
+            return ''
         if os.environ.get('STT_PROVIDER', 'local') == 'api':
             return transcribe_api(tmp.name)
         segments, _ = _whisper().transcribe(tmp.name, language='fr', beam_size=1)
@@ -110,7 +155,7 @@ def transcribe_api(path):
     base = os.environ.get('STT_BASE_URL', 'https://api.mistral.ai/v1').rstrip('/')
     key = os.environ.get('STT_API_KEY') or os.environ['LLM_API_KEY']
     with open(path, 'rb') as f:
-        r = requests.post(base + '/audio/transcriptions', timeout=20,
+        r = session.post(base + '/audio/transcriptions', timeout=20,
                           headers={'Authorization': 'Bearer ' + key},
                           data={'model': os.environ.get('STT_MODEL', 'voxtral-mini-latest'),
                                 'language': 'fr'},
@@ -144,6 +189,12 @@ def speak(text, stop=None):
                 proc.terminate()
                 break
         proc.wait()
+
+
+def preload():
+    """Charge Whisper en tâche de fond au démarrage (le 1er échange ne paie plus le chargement)."""
+    if enabled() and os.environ.get('STT_PROVIDER', 'local') == 'local':
+        threading.Thread(target=_whisper, daemon=True).start()
 
 
 if __name__ == '__main__':
