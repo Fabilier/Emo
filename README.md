@@ -32,3 +32,14 @@ python3 final.py
 ```
 Les chemins sont relatifs au dépôt : plus besoin de `/home/pi/Desktop/EmoBot`.
 Sons : happy, sad, angry, excited, dizzy, bootup, blink (synthétisés, libres de droits).
+
+## Conversation (LLM)
+Toucher Emo lance l'écoute (5 s), puis le LLM répond en voix avec une émotion.
+Prérequis : micro USB, `pip install requests faster-whisper`, [piper](https://github.com/rhasspy/piper) + voix FR.
+```
+cp Code/.env.example Code/.env   # renseigner LLM_API_KEY
+python3 Code/brain.py "Salut Emo"  # test sans matériel
+```
+Fournisseur interchangeable (Gemini par défaut, Mistral en commentaire dans `.env.example`).
+Sans `LLM_API_KEY`, le toucher déclenche l'animation `happy` comme avant.
+Palier gratuit : aucune donnée personnelle (les requêtes peuvent servir à l'entraînement).

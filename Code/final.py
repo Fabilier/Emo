@@ -17,6 +17,7 @@ import RPi.GPIO as GPIO
 from adafruit_servokit import ServoKit
 from PIL import Image
 
+import brain
 from lib import LCD_2inch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -214,7 +215,7 @@ def check_sensors():
         touched = GPIO.input(TOUCH_PIN) == GPIO.HIGH
         if touched and not touch_prev and now - last_touch > TOUCH_COOLDOWN and events.empty():
             last_touch = now
-            events.put('happy')
+            events.put('talk' if brain.enabled() else 'happy')
         touch_prev = touched
         if GPIO.input(VIBRATION_PIN) == GPIO.HIGH and now - last_vib > VIBRATION_COOLDOWN and events.empty():
             last_vib = now
@@ -243,6 +244,23 @@ def play_emotion(name):
     run_parallel((show, (name, 4)), (sound, (name,)), (EMOTION_MOVES[name], ()))
 
 
+def talk(history=[]):
+    """Conversation : écoute, LLM, puis réponse parlée avec l'émotion choisie."""
+    try:
+        run_parallel((show, ('neutral', 1)))
+        heard = brain.listen()
+        if not heard:
+            return
+        logging.info('entendu : %s', heard)
+        reply, emo = brain.ask(heard, history)
+        history += [{'role': 'user', 'content': heard}, {'role': 'assistant', 'content': reply}]
+        del history[:-6]
+        run_parallel((show, (emo, 2)), (brain.speak, (reply, stop)), (EMOTION_MOVES[emo], ()))
+    except Exception as e:  # réseau, micro, voix : Emo ne doit jamais planter
+        logging.warning('conversation impossible : %s', e)
+        play_emotion('sad')
+
+
 def idle(cycle):
     """Une boucle d'attente ; s'interrompt dès qu'un événement arrive."""
     face = 'blink2' if cycle % IDLE_BLINK_EVERY == 0 else 'neutral'
@@ -258,6 +276,11 @@ def main():
             name = events.get_nowait()
         except queue.Empty:
             name = None
+        if name == 'talk':
+            stop.clear()
+            talk()
+            servo_down()
+            continue
         if name in EMOTION_MOVES:
             stop.clear()
             play_emotion(name)
