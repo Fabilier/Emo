@@ -94,14 +94,29 @@ def ask(user_text, history=None):
 
 
 def listen(seconds=5):
-    """Enregistre le micro puis transcrit en local (faster-whisper, audio non envoyé au cloud)."""
-    from faster_whisper import WhisperModel
+    """Enregistre le micro puis transcrit (STT_PROVIDER=local par défaut, ou api)."""
     with tempfile.NamedTemporaryFile(suffix='.wav') as tmp:
         subprocess.run(['arecord', '-q', '-f', 'S16_LE', '-r', '16000', '-d', str(seconds), tmp.name],
                        check=True)
-        model = _whisper()
-        segments, _ = model.transcribe(tmp.name, language='fr')
+        if os.environ.get('STT_PROVIDER', 'local') == 'api':
+            return transcribe_api(tmp.name)
+        segments, _ = _whisper().transcribe(tmp.name, language='fr', beam_size=1)
         return ' '.join(s.text.strip() for s in segments).strip()
+
+
+def transcribe_api(path):
+    """Transcription cloud via endpoint /audio/transcriptions (Mistral Voxtral par défaut).
+    L'audio quitte le Pi : à réserver au POC ou à un fournisseur UE."""
+    base = os.environ.get('STT_BASE_URL', 'https://api.mistral.ai/v1').rstrip('/')
+    key = os.environ.get('STT_API_KEY') or os.environ['LLM_API_KEY']
+    with open(path, 'rb') as f:
+        r = requests.post(base + '/audio/transcriptions', timeout=20,
+                          headers={'Authorization': 'Bearer ' + key},
+                          data={'model': os.environ.get('STT_MODEL', 'voxtral-mini-latest'),
+                                'language': 'fr'},
+                          files={'file': ('audio.wav', f, 'audio/wav')})
+    r.raise_for_status()
+    return r.json().get('text', '').strip()
 
 
 _model = None
