@@ -18,10 +18,23 @@ import requests
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMOTIONS = ('happy', 'sad', 'angry', 'excited', 'dizzy', 'blink')
-SYSTEM_PROMPT = (
-    "Tu es Emo, un petit robot compagnon amical. Réponds en français, en une seule phrase de 15 mots maximum, droit au but, sans formule de politesse. "
+FORMAT = (
+    "Réponds en français, en une seule phrase de 15 mots maximum, droit au but, sans formule de politesse. "
     'Réponds uniquement en JSON : {"texte": "...", "emotion": "<' + '|'.join(EMOTIONS) + '>"}.'
 )
+PERSONAS = {
+    'gentil': "Tu es Emo, un petit robot compagnon amical et chaleureux. ",
+    'piquant': (
+        "Tu es Emo, un petit robot compagnon à l'esprit vif : humour sec, ironie légère, répliques "
+        "qui piquent avec tendresse, un brin rebelle et jamais méchant. Pas de vulgarité, aucune "
+        "moquerie sur l'apparence, l'origine ou la religion, pas de prise de position politique. "
+    ),
+}
+
+
+def system_prompt():
+    """Personnalité choisie par EMO_PERSONA (gentil par défaut)."""
+    return PERSONAS.get(os.environ.get('EMO_PERSONA', 'gentil'), PERSONAS['gentil']) + FORMAT
 
 
 def load_env(path=os.path.join(BASE_DIR, '.env')):
@@ -69,7 +82,7 @@ def shorten(text, limit=None):
 def ask(user_text, history=None):
     """Interroge le LLM. Retourne (texte, emotion)."""
     url = os.environ.get('LLM_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai').rstrip('/')
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, *(history or []),
+    messages = [{'role': 'system', 'content': system_prompt()}, *(history or []),
                 {'role': 'user', 'content': user_text}]
     r = requests.post(
         url + '/chat/completions', timeout=20,
