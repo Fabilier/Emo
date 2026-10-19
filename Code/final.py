@@ -17,14 +17,20 @@ import RPi.GPIO as GPIO
 from adafruit_servokit import ServoKit
 from PIL import Image
 
-import brain
 from lib import LCD_2inch
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+try:
+    import brain  # nécessite `requests` ; sans lui Emo fonctionne sans conversation
+except ImportError as e:
+    brain = None
+    logging.warning('conversation désactivée : %s', e)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMOTIONS_DIR = os.path.join(BASE_DIR, 'emotions')
 SOUND_DIR = os.path.join(BASE_DIR, 'sound')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
 # Capteurs
 TOUCH_PIN = 17
@@ -215,7 +221,7 @@ def check_sensors():
         touched = GPIO.input(TOUCH_PIN) == GPIO.HIGH
         if touched and not touch_prev and now - last_touch > TOUCH_COOLDOWN and events.empty():
             last_touch = now
-            events.put('talk' if brain.enabled() else 'happy')
+            events.put('talk' if brain and brain.enabled() else 'happy')
         touch_prev = touched
         if GPIO.input(VIBRATION_PIN) == GPIO.HIGH and now - last_vib > VIBRATION_COOLDOWN and events.empty():
             last_vib = now
@@ -226,11 +232,30 @@ def check_sensors():
 # ---------- Orchestration ----------
 
 def run_parallel(*targets):
-    threads = [threading.Thread(target=t, args=a, daemon=True) for t, a in targets]
+    """Lance les cibles en parallèle ; relève la première exception d'un worker après le join."""
+    errors = []
+
+    def runner(fn, args):
+        try:
+            fn(*args)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=runner, args=(t, a), daemon=True) for t, a in targets]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    if errors:
+        raise errors[0]
+
+
+def safe(fn, *args):
+    """Une erreur d'affichage ou de servo est journalisée, Emo continue."""
+    try:
+        fn(*args)
+    except Exception as e:
+        logging.warning('%s a échoué : %s', fn.__name__, e)
 
 
 def bootup():
@@ -287,8 +312,9 @@ def idle(cycle):
 
 def main():
     threading.Thread(target=check_sensors, daemon=True).start()
-    brain.preload()
-    bootup()
+    if brain:
+        brain.preload()
+    safe(bootup)
     cycle = 0
     while True:
         try:
@@ -302,13 +328,13 @@ def main():
             continue
         if name in EMOTION_MOVES:
             stop.clear()
-            play_emotion(name)
+            safe(play_emotion, name)
             servo_down()
             continue
         # on interrompt l'attente dès qu'un événement arrive
         stop.clear()
         cycle += 1
-        idle_thread = threading.Thread(target=idle, args=(cycle,), daemon=True)
+        idle_thread = threading.Thread(target=safe, args=(idle, cycle), daemon=True)
         idle_thread.start()
         while idle_thread.is_alive():
             if not events.empty():
