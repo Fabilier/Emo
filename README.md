@@ -21,3 +21,14 @@
 <br> 
 https://www.hackster.io/coderscafe/emo-your-personal-companion-robot-dc8afe<br> 
 https://www.instructables.com/Emo-DIY-Companion-Robot/
+
+## Installation (Raspberry Pi)
+```
+sudo apt install alsa-utils python3-pip
+pip install adafruit-circuitpython-servokit RPi.GPIO spidev pillow numpy
+cd Code
+python3 generate_sounds.py   # génère les .wav dans Code/sound
+python3 final.py
+```
+Les chemins sont relatifs au dépôt : plus besoin de `/home/pi/Desktop/EmoBot`.
+Sons : happy, sad, angry, excited, dizzy, bootup, blink (synthétisés, libres de droits).
