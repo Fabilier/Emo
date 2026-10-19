@@ -19,7 +19,7 @@ import requests
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMOTIONS = ('happy', 'sad', 'angry', 'excited', 'dizzy', 'blink')
 SYSTEM_PROMPT = (
-    "Tu es Emo, un petit robot compagnon amical. Réponds en français, en 1 ou 2 phrases courtes. "
+    "Tu es Emo, un petit robot compagnon amical. Réponds en français, en une seule phrase de 15 mots maximum, droit au but, sans formule de politesse. "
     'Réponds uniquement en JSON : {"texte": "...", "emotion": "<' + '|'.join(EMOTIONS) + '>"}.'
 )
 
@@ -53,7 +53,17 @@ def parse_reply(content):
         text, emo = str(data.get('texte', '')).strip(), data.get('emotion')
     except (ValueError, AttributeError):
         text, emo = content, None
-    return text, emo if emo in EMOTIONS else 'happy'
+    return shorten(text), emo if emo in EMOTIONS else 'happy'
+
+
+def shorten(text, limit=None):
+    """Filet de sécurité : si le LLM bavarde, on coupe à la fin de phrase avant `limit` caractères."""
+    limit = limit or int(os.environ.get('MAX_REPLY_CHARS', '120'))
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind('. '), cut.rfind('! '), cut.rfind('? '))
+    return cut[:end + 1] if end > 20 else cut.rsplit(' ', 1)[0] + '...'
 
 
 def ask(user_text, history=None):
@@ -65,7 +75,7 @@ def ask(user_text, history=None):
         url + '/chat/completions', timeout=20,
         headers={'Authorization': 'Bearer ' + os.environ['LLM_API_KEY']},
         json={'model': os.environ.get('LLM_MODEL', 'gemini-2.5-flash'), 'messages': messages,
-              'response_format': {'type': 'json_object'}, 'max_tokens': 150})
+              'response_format': {'type': 'json_object'}, 'max_tokens': 80})
     r.raise_for_status()
     return parse_reply(r.json()['choices'][0]['message']['content'])
 
